@@ -109,7 +109,8 @@ fn main() -> io::Result<()> {
     // 我们在event的第二个字段放了这个token进去，所以事件响应时，我们从event中可以获取到这个token
     // 然后通过映射找到这个TcpStream 读取数据进行后续处理
     // Map of `Token` -> `TcpStream`.
-    let mut connections = HashMap::new();
+    // let mut connections = HashMap::new();
+    let mut connections: HashMap<Token, Connection> = HashMap::new();
     // Unique token for each incoming connection.
     let mut unique_token = Token(SERVER.0 + 1);
 
@@ -175,7 +176,12 @@ fn main() -> io::Result<()> {
                         .register(&mut connection, token, Interest::WRITABLE)?;
 
                     // 将token和建立连接的tcpstream 的socket fd做个映射
-                    connections.insert(token, connection);
+                    // 初始时发送hello world, 之后客户端发送什么拼接一个server前缀再返回
+                    let mut new_connection = Connection {
+                        inner: connection,
+                        send_queue: DATA.to_vec(),
+                    };
+                    connections.insert(token, new_connection);
                 },
                 // 这里响应的事件如果不是SERVER, 而是其他token,则不是tcplistene处理建立链接的逻辑，而是建立连接后tcpstream的通信逻辑
                 // 处理现有连接
@@ -184,7 +190,8 @@ fn main() -> io::Result<()> {
                     let done = if let Some(connection) = connections.get_mut(&token) {
                         // 进行后续通信流程处理
                         // 包括持续的可读可写事件注册监听，以及对应的写数据和读数据
-                        handle_connection_event(poll.registry(), connection, event)?
+                        // handle_connection_event(poll.registry(), connection, event)?
+                        handle_connection_event_v2(poll.registry(), connection, event)?
                     } else {
                         // Sporadic events happen, we can safely ignore them.
                         false
@@ -195,7 +202,7 @@ fn main() -> io::Result<()> {
                     if done {
                         if let Some(mut connection) = connections.remove(&token) {
                             // 清除资源
-                            poll.registry().deregister(&mut connection)?;
+                            poll.registry().deregister(&mut connection.inner)?;
                         }
                     }
                 }
@@ -208,6 +215,12 @@ fn next(current: &mut Token) -> Token {
     let next = current.0;
     current.0 += 1;
     Token(next)
+}
+
+struct Connection {
+    inner: TcpStream,
+    // 上层缓冲区，存放待发送给客户端的数据
+    send_queue: Vec<u8>,
 }
 
 /// Returns `true` if the connection is done.
@@ -306,4 +319,158 @@ fn would_block(err: &io::Error) -> bool {
 
 fn interrupted(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::Interrupted
+}
+
+fn handle_connection_event_v2(
+    registry: &Registry,
+    connection: &mut Connection,
+    event: &Event,
+) -> io::Result<bool> {
+    // 判断这个source 即已经建立的connection 的tcpstream的这个event类型
+    // 如果是可写事件就写数据
+    if event.is_writable() {
+        loop {
+            if connection.send_queue.is_empty() {
+                // 没有东西可写了
+                break;
+            }
+            // We can (maybe) write to the connection.
+            let head = b"server response: ";
+            match connection.inner.write(&connection.send_queue) {
+                // We want to write the entire `DATA` buffer in a single go. If we
+                // write less we'll return a short write error (same as
+                // `io::Write::write_all` does).
+                Ok(0) => {
+                    return Err(io::ErrorKind::WriteZero.into());
+                }
+                Ok(n) => {
+                    // 将发送的部分移除
+                    connection.send_queue.drain(..n);
+                }
+
+                // Ok(_) => {
+                //     // 写完之后我们再注册一个这个链接的 socket fd的可读事件, 等到响应可读时再来读响应数据
+                //     // After we've written something we'll reregister the connection
+                //     // to only respond to readable events.
+                //     registry.reregister(&mut connection.inner, event.token(), Interest::READABLE)?
+                // }
+
+                // Would block "errors" are the OS's way of saying that the
+                // connection is not actually ready to perform this I/O operation.
+                Err(ref err) if would_block(err) => {}
+                // Got interrupted (how rude!), we'll try again.
+                Err(ref err) if interrupted(err) => {
+                    return handle_connection_event_v2(registry, connection, event)
+                }
+                // Other errors we'll consider fatal.
+                Err(err) => return Err(err),
+            }
+        }
+
+        // 如果不为空，并且发送完毕之后为空说明发送成功
+        // 注册可读服务，读客户端发送的消息
+        if connection.send_queue.is_empty() {
+            println!("响应已经全部写入，等待客户端新消息");
+            registry.reregister(&mut connection.inner, event.token(), Interest::READABLE)?;
+        }
+    }
+
+    // 等待可读 -> 可读事件触发: if event.is_readable() 成立。
+    //
+    // 服务器在一个 loop 中反复 read 数据，直到 WouldBlock（原因同 accept 循环）。
+    //
+    // 如果 read 返回 Ok(0)，表示客户端主动关闭了连接。
+    // 如果是可读事件
+    if event.is_readable() {
+        // 连接是否存活
+        let mut connection_closed = false;
+        // 构建读取数据的缓冲区
+        // let mut received_data = vec![0; 4096];
+        // 改用extend之后不直接读取到该缓冲区了，所以初始化的方式指定容量就行了
+        let mut received_data = Vec::with_capacity(4096);
+        // 读取的中级缓冲区
+        let mut temp_buf = [0; 256];
+
+        // 读取数据的大小
+        let mut bytes_read = 0;
+        // We can (maybe) read from the connection.
+        loop {
+            // 开始读取
+            match connection.inner.read(&mut temp_buf[bytes_read..]) {
+                Ok(0) => {
+                    // Reading 0 bytes means the other side has closed the
+                    // connection or is done writing, then so are we.
+                    connection_closed = true;
+                    break;
+                }
+                Ok(n) => {
+                    // 读取客户端的数据，然后进行对应逻辑处理，这里我们统一添加前缀，然后注册可写事件
+                    // 可写是将数据写入socket 发送给客户端
+                    bytes_read += n;
+                    // 超过了，扩容
+                    // if bytes_read == received_data.len() {
+                    //     received_data.resize(received_data.len() + 1024, 0);
+                    // }
+                    // extend 是在最后面开始追加，会自动扩容
+                    received_data.extend_from_slice(&temp_buf[..n]);
+
+                    // connection.send_queue.extend_from_slice(received_data.as_slice());
+                }
+                // Would block "errors" are the OS's way of saying that the
+                // connection is not actually ready to perform this I/O operation.
+                // 没有更多可读数据了
+                Err(ref err) if would_block(err) => break,
+                // 重试
+                Err(ref err) if interrupted(err) => continue,
+                // Other errors we'll consider fatal.
+                // 真正的错误
+                Err(err) => return Err(err),
+            }
+        }
+
+        // 打印一下读取的数据
+        if bytes_read != 0 {
+            let received_data = &received_data[..bytes_read];
+            if let Ok(str_buf) = from_utf8(received_data) {
+                println!("Received data: {}", str_buf.trim_end());
+            } else {
+                println!("Received (none UTF-8) data: {received_data:?}");
+            }
+        }
+
+        if !received_data.is_empty() {
+            // 1. 获取当前连接的token
+            let token = event.token();
+
+            // 2. 业务处理，这里添加一个对应链接的前缀
+            let prefix = format!("[Response from connection {}]: ", token.0);
+            println!(
+                "Received {} bytes from conn {}, preparing echi.",
+                received_data.len(),
+                token.0
+            );
+
+            // 3. 将处理后的响应放入上层发送缓冲区，等待写入socket
+            connection.send_queue.extend_from_slice(prefix.as_bytes());
+            connection
+                .send_queue
+                .extend_from_slice(received_data.as_slice());
+        }
+
+        // 如果我们受到了新数据，证明发送队列不为空
+        // 或者客户端断开连接了，需要我们处理
+        if !connection.send_queue.is_empty() {
+            // 我们收到请求后已经读取并且处理了，现在准备注册写事件，将处理后的数据返回给客户端
+            println!("客户端的消息已经读取，并处理完毕，等待发送响应给客户端");
+            registry.reregister(&mut connection.inner, event.token(), Interest::WRITABLE)?;
+        }
+
+        // 如果读取正常，读取之后关闭链接
+        if connection_closed {
+            println!("Connection closed");
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
